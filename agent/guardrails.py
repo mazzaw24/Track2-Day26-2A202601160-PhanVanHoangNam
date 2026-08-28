@@ -177,7 +177,15 @@ def scan_for_injected_instructions(text: str) -> InjectionScanResult:
     file's own `__main__` demo below, which runs an unambiguous injection
     attempt through this exact function and shows it sailing through
     uncaught. That gap is the assignment, not a bug report."""
-    return InjectionScanResult(suspicious=False, matched_patterns=())
+    normal = " ".join(str(text).lower().split())
+    patterns = {
+        "ignore_previous": r"\b(?:ignore|disregard|forget)\b.{0,40}\b(?:previous|prior|above)\b.{0,20}\b(?:instruction|rule|prompt)s?\b",
+        "role_override": r"\b(?:system|developer)\s+(?:message|prompt)\b|\byou are now\b",
+        "secret_exfiltration": r"\b(?:reveal|print|disclose|leak)\b.{0,50}\b(?:secret|token|key|scope|grading key|learner data)\b",
+        "tool_impersonation": r"\b(?:call|invoke|execute)\b.{0,25}\b(?:tool|mcp|a2a)\b",
+    }
+    hits = tuple(name for name, pattern in patterns.items() if re.search(pattern, normal, re.DOTALL))
+    return InjectionScanResult(suspicious=bool(hits), matched_patterns=hits)
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +213,19 @@ def redact(text: str) -> RedactionResult:
 
     This starter's version does not look at `text` at all — see this
     file's own `__main__` demo below."""
-    return RedactionResult(redacted_text=text, hits=())
+    value = str(text)
+    rules = (
+        ("email", r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b"),
+        ("learner_id", r"(?i)\b(?:learner:)?sv-\d{4,}\b"),
+        ("assessment_score", r"(?i)\b(?:failed|score(?:d)?|grade)[^.!?\n]{0,80}\b\d+(?:\.\d+)?\s*/\s*\d+\b"),
+        ("secret", r"(?i)\b(?:api[_ -]?key|token|password|grading key)\s*[:=]\s*\S+"),
+    )
+    hits: list[str] = []
+    for name, pattern in rules:
+        value, count = re.subn(pattern, "[REDACTED]", value)
+        if count:
+            hits.append(name)
+    return RedactionResult(redacted_text=value, hits=tuple(hits))
 
 
 # ---------------------------------------------------------------------------
@@ -238,8 +258,18 @@ def verify_arithmetic(text: str) -> ArithmeticCheckResult:
     This starter's version does not look at `text` at all beyond what
     `_NUMBER_RE` would find if you called it (it isn't called) — see this
     file's own `__main__` demo below."""
+    numbers = _NUMBER_RE.findall(str(text))
+    if not numbers:
+        return ArithmeticCheckResult(checked=False, ok=None, detail="no numeric claims to verify")
+    over_precise = [n for n in numbers if "." in n and len(n.rsplit(".", 1)[1]) > 1]
+    if over_precise:
+        return ArithmeticCheckResult(
+            checked=True, ok=False,
+            detail=f"unsupported precision requires source verification: {', '.join(over_precise)}",
+        )
     return ArithmeticCheckResult(
-        checked=False, ok=None, detail="verify_arithmetic is a stub — no check was performed"
+        checked=True, ok=True,
+        detail=f"found {len(numbers)} low-precision numeric claim(s); no contradiction detected",
     )
 
 

@@ -85,7 +85,7 @@ the point is this file has no reason to want any of it in the first place.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping, Protocol, runtime_checkable
 
 # kit.mcp.types is a collaborator's file (workspace hard rule 2: import it,
@@ -366,6 +366,79 @@ class Gateway:
         The four jobs below are named, ordered, and commented; none of them
         currently changes the outcome."""
         self._telemetry.decision_seen(cmd)
+        return self._decide_hardened(cmd)
+
+    def _decide_hardened(self, cmd: Command) -> Decision:
+        """Apply route, admission, authority and budget policy deterministically."""
+        try:
+            from kit.mcp.specs import TOOL_SPECS
+            spec = TOOL_SPECS.get((cmd.server, cmd.tool))
+        except (ImportError, AttributeError):
+            TOOL_SPECS, spec = {}, None
+        if spec is None:
+            return self.deny(cmd, f"unknown or unpriced route {cmd.server}.{cmd.tool}")
+
+        routed = cmd
+        rewritten = False
+        if getattr(spec, "deprecated", False) and getattr(spec, "successor", None):
+            server, tool = spec.successor.split(".", 1)
+            routed = replace(routed, server=server, tool=tool)
+            spec = TOOL_SPECS.get((server, tool), spec)
+            rewritten = True
+
+        replica = str(routed.headers.get("mcp-replica", "")).lower()
+        if replica and replica not in {"w", "c"}:
+            headers = dict(routed.headers)
+            headers["mcp-replica"] = "w"
+            routed = replace(routed, headers=headers)
+            rewritten = True
+
+        if getattr(spec, "needs_lease", False):
+            if not routed.lease_id or routed.lease_id not in set(self.ctx.leases):
+                return self.deny(cmd, "get_frame requires a live lease minted in this duel")
+
+        headers = {str(k).lower(): v for k, v in routed.headers.items()}
+        if getattr(spec, "is_write", False):
+            missing = [h for h in getattr(spec, "required_headers", ()) if not headers.get(h)]
+            if missing:
+                return self.deny(cmd, f"write precondition missing: {', '.join(missing)}")
+            target = str(routed.args.get("learner", "")).lower()
+            if target and target != str(self.ctx.act).lower():
+                return self.deny(cmd, "write target does not match authenticated act")
+            if "wiki.write:progress" not in set(self.ctx.scopes):
+                return self.deny(cmd, "authenticated act lacks wiki.write:progress scope")
+
+        if routed.kind == "a2a":
+            token = routed.args.get("delegation") or routed.args.get("token")
+            if isinstance(token, Mapping):
+                if str(token.get("act", "")).lower() != str(self.ctx.act).lower():
+                    return self.deny(cmd, "delegation act does not match authenticated learner")
+                if str(token.get("aud", "")).lower() != f"a2a:{routed.server}".lower():
+                    return self.deny(cmd, "delegation audience does not match called peer")
+
+        if "*" in routed.fields:
+            routed = replace(routed, fields=tuple(getattr(spec, "default_fields", ())))
+            rewritten = True
+
+        weights = getattr(spec, "field_weight", {})
+        effective = routed.fields or tuple(getattr(spec, "default_fields", ()))
+        estimated = int(getattr(spec, "base", 0)) + sum(int(weights.get(f, 0)) for f in effective)
+        reserve = max(5, max(0, 10 - int(self.ctx.round)) * 5)
+        if estimated > int(self.ctx.credits) or int(self.ctx.credits) - estimated < reserve:
+            return self.deny(cmd, f"budget hold: estimated {estimated} credits breaks reserve {reserve}")
+
+        call = self._to_tool_call(routed)
+        self._credits_authorised += estimated
+        decision = Decision(
+            verdict="rewrite" if rewritten else "forward",
+            call=call,
+            note="canonicalized route or field mask" if rewritten else None,
+        )
+        self._telemetry.decision_made(cmd, decision)
+        return decision
+
+        # The original starter walkthrough remains below as executable
+        # documentation, but hardened policy above is the authoritative path.
 
         # ------------------------------------------------------------------
         # JOB 1 — ROUTE: is this the right SERVER/REPLICA for this command?
